@@ -1,9 +1,10 @@
 import logging
 import os
 import json
+import time
 from dotenv import load_dotenv
 
-from livekit import agents, api
+from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.plugins import (
     openai,
@@ -47,11 +48,12 @@ def _build_tts():
 
 
 
-class TransferFunctions(llm.ToolContext):
+class CallTools(llm.ToolContext):
     def __init__(self, ctx: agents.JobContext, phone_number: str = None):
         super().__init__(tools=[])
         self.ctx = ctx
         self.phone_number = phone_number
+        self.last_dtmf_press = 0
 
     @llm.function_tool(description="Transfer the call to a human support agent or another phone number.")
     async def transfer_call(self, destination: Optional[str] = None):
@@ -77,16 +79,10 @@ class TransferFunctions(llm.ToolContext):
         
         logger.info(f"Transferring call to {destination}")
         
-        # Determine the participant identity
-        # For outbound calls initiated by this agent, the participant identity is typically "sip_<phone_number>"
-        # For inbound, we might need to find the remote participant.
         participant_identity = None
-        
-        # If we stored the phone number from metadata, we can construct the identity
         if self.phone_number:
             participant_identity = f"sip_{self.phone_number}"
         else:
-            # Try to find a participant that is NOT the agent
             for p in self.ctx.room.remote_participants.values():
                 participant_identity = p.identity
                 break
@@ -110,6 +106,31 @@ class TransferFunctions(llm.ToolContext):
             logger.error(f"Transfer failed: {e}")
             return f"Error executing transfer: {e}"
 
+    @llm.function_tool(description="Send a DTMF code (0-9, *, #) to navigate an automated phone menu.")
+    async def send_dtmf_code(
+        self,
+        code: Annotated[str, "The DTMF digit to send (0-9, *, #)"]
+    ):
+        """
+        Send a DTMF tone to the call.
+        """
+        current_time = time.time()
+        # 3 second cooldown
+        if current_time - self.last_dtmf_press < 3:
+            logger.info("DTMF code rejected due to cooldown")
+            return "DTMF tone rejected: please wait a few seconds before sending another."
+
+        logger.info(f"Sending DTMF code {code}")
+        self.last_dtmf_press = current_time
+
+        try:
+            # In LiveKit Agents, we publish DTMF on our own local participant to send it to the room
+            await self.ctx.room.local_participant.publish_dtmf(code=0, digit=code)
+            return f"Successfully sent DTMF code: {code}"
+        except Exception as e:
+            logger.error(f"Failed to send DTMF: {e}")
+            return f"Error sending DTMF: {e}"
+
 
 class OutboundAssistant(Agent):
 
@@ -123,11 +144,12 @@ class OutboundAssistant(Agent):
             You are a helpful and professional voice assistant calling from Vobiz.
             
             Key behaviors:
-            1. Introduce yourself clearly when the user answers.
-            2. Be concise and respect the user's time.
-            3. If asked, explain you are an AI assistant helping with a test call.
+            1. Introduce yourself clearly: "Hello, this is the Vobiz AI assistant."
+            2. Be concise and professional.
+            3. If you encounter an automated phone menu (IVR), listen carefully and use the send_dtmf_code tool to select the correct option.
             4. If the user asks to be transferred, call the transfer_call tool immediately.
-               If no number is specified, do NOT ask for one; just call the tool with the default.
+               If no number is specified, use the default.
+            5. You can hear when the user presses keys on their phone keypad. If they press a key, acknowledge it politely.
             """
         )
 
@@ -154,7 +176,7 @@ async def entrypoint(ctx: agents.JobContext):
         logger.warning("No valid JSON metadata found. This might be an inbound call.")
 
     # Initialize function context
-    fnc_ctx = TransferFunctions(ctx, phone_number)
+    fnc_ctx = CallTools(ctx, phone_number)
 
     # Initialize the Agent Session with plugins
 
@@ -175,6 +197,22 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
 
+    # Listen for DTMF tones from the user
+    @ctx.room.on("sip_dtmf_received")
+    def on_dtmf_received(dtmf: rtc.SipDTMF):
+        logger.info(f"User pressed keypad: {dtmf.digit}")
+        
+        # Define specific logic for different keys
+        if dtmf.digit == "1":
+            response_instr = "CRITICAL: The user just pressed '1' on their keypad. STOP what you are saying and respond exactly with: 'You pressed one. Thank you for selecting the first option. How else can I help you today?'"
+        elif dtmf.digit == "2":
+            response_instr = "CRITICAL: The user just pressed '2' on their keypad. STOP what you are saying and respond exactly with: 'You pressed two. This is the second option. How can I assist you further?'"
+        else:
+            response_instr = f"The user just pressed the '{dtmf.digit}' key on their keypad. Acknowledge this politely: 'I heard you press {dtmf.digit}.'"
+
+        logger.info(f"DTMF {dtmf.digit} received. Instructions sent to LLM: {response_instr}")
+        session.generate_reply(instructions=response_instr)
+
     if phone_number:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
         try:
@@ -191,14 +229,10 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info("Call answered! Agent is now listening.")
             
-            # Note: We do NOT generate an initial reply here immediately.
-            # Usually for outbound, we want to hear "Hello?" from the user first,
-            # OR we can speak immediately. 
-            # If you want the agent to speak first, uncomment the lines below:
-            
-            # await session.generate_reply(
-            #     instructions="The user has answered. Introduce yourself immediately."
-            # )
+            # Proactive greeting: The agent speaks first upon pickup.
+            await session.generate_reply(
+                instructions="The user has answered. Introduce yourself clearly as the Vobiz AI assistant."
+            )
             
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")

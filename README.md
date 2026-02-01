@@ -9,7 +9,11 @@ This project provides a production-ready solution for making outbound AI phone c
 | `agent.py` | The main AI worker. It runs in the background, waits for dispatch jobs, and places outbound calls. |
 | `make_call.py` | A utility script to trigger calls. It dispatches the agent to a unique room with the target phone number. |
 | `setup_trunk.py` | Script to configure the LiveKit SIP Trunk with Vobiz credentials. |
+| `dtmf_guide.md` | **[NEW]** Guide for using DTMF navigation and reception (IVR). |
 | `transfer_call.md` | Guide for configuring and using SIP transfers. |
+
+> [!TIP]
+> **For IVR / Keypad Features**: If you want to use DTMF navigation and keypad detection, check out the `dtmf-ivr` branch for the latest implementation and the [dtmf_guide.md](dtmf_guide.md) for details.
 | `.env.example` | Template for environment variables and secrets. |
 | `requirements.txt` | List of Python dependencies. |
 
